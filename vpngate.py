@@ -50,8 +50,19 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://jiakvpn1.qingrs.ccwu.cc/check?sstp=vpn:vpn@")
+# 已部署的 Cloudflare Worker 检测接口 (GET /check?sstp=vpn:vpn@host:port)
+# 支持配置多个候选地址 (逗号分隔): 启动时按顺序探活, 自动使用第一个真正可用的。
+# 注意: 一旦某个域名被回收 / 解析到别的站点 (例如回落到 nginx 静态页),
+#       它会返回 HTTP 200 + HTML 而不是 Worker 的 JSON —— 旧版本会因此整轮硬失败。
+DEFAULT_WORKERS = (
+    "https://jiakvpn1.qingrs.ccwu.cc/check?sstp=vpn:vpn@,"
+    "https://poni.qingrs.ccwu.cc/check?sstp=vpn:vpn@"
+)
+WORKER_CHECK_URLS = [
+    u.strip().rstrip("/") for u in os.environ.get("CHECK_WORKER", DEFAULT_WORKERS).split(",") if u.strip()
+]
+WORKER_CHECK_URL = WORKER_CHECK_URLS[0]   # 实际使用的地址 (探活后可能被替换)
+UA = os.environ.get("UA", "Mozilla/5.0 (gate-checker)")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -281,6 +292,53 @@ def dedupe(nodes):
 # ---------------------------------------------------------------------------
 # 第 3 步: 并发调用 Cloudflare Worker
 # ---------------------------------------------------------------------------
+# 探针目标: 必然失败的地址。只要对方是"会返回 JSON 的检测 Worker",
+# 就会回 {"success": false, "error": ...}; 若对方是静态站/nginx, 则返回 HTML。
+HEALTH_PROBE_TARGET = os.environ.get("HEALTH_PROBE_TARGET", "127.0.0.1:1")
+
+
+def probe_worker(base_url, session, timeout=20):
+    """健康探针。返回 (ok: bool, detail: str)。
+    只判断"这个地址现在是不是一个会返回 JSON 的检测 Worker", 不判断节点可用性。"""
+    url = base_url + quote(HEALTH_PROBE_TARGET, safe="")
+    try:
+        r = session.get(url, timeout=timeout, headers={"User-Agent": UA})
+    except Exception as exc:
+        return False, f"请求异常 {type(exc).__name__}: {str(exc)[:160]}"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code} (期望 200)"
+    ctype = r.headers.get("Content-Type", "") or "?"
+    try:
+        j = r.json()
+    except Exception:
+        snippet = re.sub(r"\s+", " ", r.text[:100]).strip()
+        return False, (f"返回的不是 JSON (HTTP 200, Content-Type={ctype}), 开头片段: {snippet!r} "
+                       f"→ 该域名很可能已被回收/回落成静态站点, 不再是检测 Worker")
+    if not isinstance(j, dict) or not ({"success", "error", "message"} & set(j)):
+        got = list(j)[:8] if isinstance(j, dict) else type(j).__name__
+        return False, f"JSON 结构不符合 Worker 约定 (顶层字段: {got})"
+    return True, "ok"
+
+
+def resolve_worker(session):
+    """按顺序探活候选 Worker, 返回第一个可用的 base_url; 全部不可用则 die。"""
+    tried = []
+    for base in WORKER_CHECK_URLS:
+        ok, detail = probe_worker(base, session)
+        tried.append((base, ok, detail))
+        if ok:
+            log("CLOUDFLARE WORKER", f"检测 Worker 已就绪: {base}")
+            if base != WORKER_CHECK_URLS[0]:
+                log("CLOUDFLARE WORKER", f"注意: 已自动切换到备用 Worker (首选地址不可用)")
+            return base
+        log("CLOUDFLARE WORKER", f"候选 Worker 不可用: {base}")
+        log("CLOUDFLARE WORKER", f"    原因: {detail}")
+    lines = "\n".join(f"  - {b} -> {d}" for b, _, d in tried)
+    die("所有候选检测 Worker 均不可用, 检测服务完全不可用 (不生成空结果)\n"
+        f"已尝试的地址:\n{lines}\n"
+        "请检查 CHECK_WORKER 配置, 或重新部署自己的检测 Worker 后重试。")
+
+
 def classify_network(host, exit_org, is_datacenter=None):
     """住宅/机房分类, 按可信度排序:
     1) Worker 返回的真实 is_datacenter 标志 (IP 情报库);
@@ -307,10 +365,10 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 
-def check_one(node, session):
+def check_one(node, session, worker_url):
     """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
     单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+    url = worker_url + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -319,12 +377,22 @@ def check_one(node, session):
     out["exit"] = None
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": UA})
         if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
+            out["error"] = f"Worker HTTP {r.status_code}"
             out["worker_error"] = True
             return out
-        j = r.json()
+        try:
+            j = r.json()
+        except Exception:
+            # 关键: 这里以前只会抛出 JSONDecodeError 被笼统记为"Worker 异常",
+            # 看不到真实原因 (对方页面回落到 nginx 静态站时就是这种表现)。
+            ctype = r.headers.get("Content-Type", "?")
+            snippet = re.sub(r"\s+", " ", r.text[:80]).strip()
+            out["error"] = (f"Worker 返回非 JSON (HTTP 200, Content-Type={ctype}), "
+                            f"片段: {snippet!r} → 该地址已不是检测 Worker")
+            out["worker_error"] = True
+            return out
         ok = bool(j.get("success"))
         out["success"] = ok
         out["status"] = "success" if ok else "failed"
@@ -357,11 +425,11 @@ def check_one(node, session):
         return out
 
 
-def check_all(nodes, session):
+def check_all(nodes, session, worker_url):
     """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(check_one, n, session, worker_url) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -679,9 +747,13 @@ def main():
     log("VPN GATE", f"去重后: {len(uniq)}")
 
     # 3) 并发检测
+    worker_url = resolve_worker(session)
+    global WORKER_CHECK_URL
+    WORKER_CHECK_URL = worker_url
+
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
-    results = check_all(uniq, session)
+    results = check_all(uniq, session, worker_url)
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
@@ -692,9 +764,16 @@ def main():
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
+    # 打印前几条错误样本, 便于一眼看出是"节点不可用"还是"Worker 坏了"
+    for sample in failed[:3]:
+        log("CLOUDFLARE WORKER", f"    样本错误 [{sample['host']}:{sample['port']}]: {str(sample.get('error'))[:150]}")
+
     # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
     if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+        why = worker_errors[0].get("error") if worker_errors else "未知"
+        die(f"Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)\n"
+            f"Worker: {worker_url}\n"
+            f"典型错误: {str(why)[:200]}")
 
     # 4) 结果 + 网页
     data = build_outputs(results, raw_count, sstp_count, source)
