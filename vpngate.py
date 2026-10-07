@@ -456,12 +456,26 @@ def build_chains_text(data):
 
 # edgetunnel 入口地址池: 客户端直连 Cloudflare 的优选 IP:端口 (循环分配给每个国家节点当入口)
 # 可通过环境变量 EDGE_HOSTS 覆盖 (逗号分隔)
+DEFAULT_EDGE_HOSTS = (
+    "openai.com:443,ahrefs.com:443,www.shopify.com:443,www.mastervolt.com:443,"
+    "www.dbs.com.sg:443,hzytjy.cn:443,cf.777791.xyz:443,www.zendesk.com:443,"
+    "egov.uscis.gov:443,store.ubi.com:443,m.iyf.tv:443,www.gov.il:443,"
+    "mfa.gov.ua:443,www.broadcom.com:443,staticdelivery.nexusmods.com:443,"
+    "coreweave.com:443,www.wto.org:443,markmonitor.com:443,www.bis.gov:443,"
+    "linear.app:443,www.carousell.sg:443,www.vmware.com:443,uspto.gov:443,"
+    "www.sage.com:443,www.leics.police.uk:443,jobsdb.com:443,www.deepl.com:443,"
+    "p.etime.vip:443,www.crazygames.fr:443,www.vastnovel.com:443,"
+    "bbs.alipansou.com:443,cf.1o.ee:443,www.mfyx.cn:443,api.gzcrtw.com:443,"
+    "53.fs1.hubspotusercontent-na1.net:443,cf-cname.xingpingcn.top:443,"
+    "cloudflare.idc.rocks:443,cf.itv888.cn:443,vps.cheng2001.top:443,"
+    "cdn.204910.best:443,saas.sin.fan:443,cf.3666888.xyz:443,cf.877774.xyz:443,"
+    "cf.xreak.top:443,serviceshub.samsclub.com:443,cdn.7zz.cn:443,"
+    "www.mc.js.cool:443,mail.notion.com:443"
+)
+
 EDGE_HOSTS = [
     h.strip()
-    for h in os.environ.get(
-        "EDGE_HOSTS",
-        "openai.com:443","ahrefs.com:443","www.shopify.com:443","www.mastervolt.com:443","www.dbs.com.sg:443","hzytjy.cn:443","cf.777791.xyz:443","www.zendesk.com:443","egov.uscis.gov:443","store.ubi.com:443","m.iyf.tv:443","www.gov.il:443","mfa.gov.ua:443","www.broadcom.com:443","staticdelivery.nexusmods.com:443","coreweave.com:443","www.wto.org:443","markmonitor.com:443","www.bis.gov:443","linear.app:443","www.carousell.sg:443","www.vmware.com:443","uspto.gov:443","www.sage.com:443","www.leics.police.uk:443","jobsdb.com:443","www.deepl.com:443","p.etime.vip:443","www.crazygames.fr:443","www.vastnovel.com:443","bbs.alipansou.com:443","cf.1o.ee:443","www.mfyx.cn:443","api.gzcrtw.com:443","53.fs1.hubspotusercontent-na1.net:443","cf-cname.xingpingcn.top:443","cloudflare.idc.rocks:443","cf.itv888.cn:443","vps.cheng2001.top:443","cdn.204910.best:443","saas.sin.fan:443","cf.3666888.xyz:443","cf.877774.xyz:443","cf.xreak.top:443","serviceshub.samsclub.com:443","cdn.7zz.cn:443","www.mc.js.cool:443","mail.notion.com:443",
-    ).split(",")
+    for h in os.environ.get("EDGE_HOSTS", DEFAULT_EDGE_HOSTS).split(",")
     if h.strip()
 ]
 
